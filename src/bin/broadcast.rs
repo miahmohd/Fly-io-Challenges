@@ -1,10 +1,12 @@
 use flyio::{Body, Message, Node};
 
 use anyhow::{bail, Result};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self},
+    ops::Sub,
     thread,
     time::Duration,
 };
@@ -42,6 +44,8 @@ enum Event<P> {
 struct BroadcastState {
     topology: HashMap<String, Vec<String>>,
     messages: HashSet<i32>,
+
+    known_to_neighbors: HashMap<String, HashSet<i32>>,
 }
 
 fn main() -> Result<()> {
@@ -68,7 +72,8 @@ fn main() -> Result<()> {
     // Create gossip events
     let g_tx = tx.clone();
     let g_th = thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(500));
+        let mut rng = rand::thread_rng();
+        thread::sleep(Duration::from_millis(100 + rng.gen_range(0..200)));
         let _ = g_tx.send(Event::Gossip);
     });
 
@@ -77,33 +82,52 @@ fn main() -> Result<()> {
     for event in rx {
         match event {
             Event::Gossip => {
-                if let Some(neighbors) = state.topology.get(&node.id) {
-                    for n in neighbors {
-                        node.send(&Message {
-                            src: node.id.clone(),
-                            dest: n.clone(),
-                            body: Body {
-                                msg_id: Some(node.message_id.clone()),
-                                in_reply_to: None,
-                                payload: BroadcastPayload::Gossip {
-                                    messages: state.messages.clone(),
-                                },
+                // ignore given topology, each node is neighbor of half the nodes (next 13),
+                // Include real neighbors to account for net partitions
+
+                let new_neighbors = get_neighbors(&node, &state);
+
+                eprintln!(
+                    "nodes: {:?}, new neighbors: {:?}, oldneighbors: {:?}",
+                    node.node_ids,
+                    new_neighbors,
+                    state.topology.get(&node.id).unwrap_or(&Vec::new())
+                );
+
+                for n in new_neighbors {
+                    // Send only messages not known to n
+                    let t = &HashSet::new();
+                    let known_messages_to_n = state.known_to_neighbors.get(&n).unwrap_or(t);
+                    node.send(&Message {
+                        src: node.id.clone(),
+                        dest: n.clone(),
+                        body: Body {
+                            msg_id: Some(node.message_id.clone()),
+                            in_reply_to: None,
+                            payload: BroadcastPayload::Gossip {
+                                messages: state.messages.sub(known_messages_to_n),
+                                // messages: state.messages.clone(),
                             },
-                        })?;
-                    }
+                        },
+                    })?;
                 }
             }
             //
             //
             Event::Message(msg) => match msg.body.payload {
-                BroadcastPayload::Gossip { messages } => state.messages.extend(messages),
+                BroadcastPayload::Gossip { messages } => {
+                    state
+                        .known_to_neighbors
+                        .entry(msg.src)
+                        .and_modify(|s| s.extend(messages.clone()))
+                        .or_insert(HashSet::new());
+                    state.messages.extend(messages)
+                }
 
                 BroadcastPayload::Broadcast { message } => {
-                    state.messages.insert(message);
-
                     let reply = Message {
                         src: node.id.clone(),
-                        dest: msg.src,
+                        dest: msg.src.clone(),
                         body: Body {
                             msg_id: Some(node.message_id.clone()),
                             in_reply_to: msg.body.msg_id,
@@ -112,11 +136,33 @@ fn main() -> Result<()> {
                     };
 
                     node.send(&reply)?;
+
+                    if !state.messages.contains(&message) {
+                        // for neighbor in get_neighbors(&node, &state) {
+                        //     if neighbor == msg.src {
+                        //         continue;
+                        //     }
+
+                        //     let reply = Message {
+                        //         src: node.id.clone(),
+                        //         dest: neighbor,
+                        //         body: Body {
+                        //             msg_id: Some(node.message_id.clone()),
+                        //             in_reply_to: None,
+                        //             payload: BroadcastPayload::Broadcast { message },
+                        //         },
+                        //     };
+
+                        //     node.send(&reply)?;
+                        // }
+
+                        state.messages.insert(message);
+                    }
                 }
 
                 BroadcastPayload::Topology { topology } => {
+                    eprintln!("Topology : {:?}", topology);
                     state.topology = topology;
-
                     let reply = Message {
                         src: node.id.clone(),
                         dest: msg.src,
@@ -145,6 +191,10 @@ fn main() -> Result<()> {
 
                     node.send(&reply)?;
                 }
+
+                BroadcastPayload::BroadcastOk => {
+                    eprintln!("Broadcast Ok")
+                }
                 _ => bail!("unknown payload: {:?}", msg),
             },
         }
@@ -154,4 +204,45 @@ fn main() -> Result<()> {
     let _ = g_th.join();
 
     Ok(())
+}
+
+fn get_neighbors(
+    node: &Node<BroadcastState, BroadcastPayload>,
+    state: &BroadcastState,
+) -> BTreeSet<String> {
+    // let neighbors = BTreeSet::new();
+
+    let i = node
+        .node_ids
+        .iter()
+        .position(|n| node.id == *n)
+        .expect("cannot fine node in nodes_ids");
+
+    let t = Vec::new();
+
+    // node.node_ids
+    //     .clone()
+    //     .iter()
+    //     .map(|s| s.clone())
+    //     .cycle()
+    //     .skip(i + 1)
+    //     .take(10)
+    //     .chain(
+    //         state
+    //             .topology
+    //             .get(&node.id)
+    //             .unwrap_or(&t)
+    //             .iter()
+    //             .map(|s| s.clone()),
+    //     )
+    //     .collect::<BTreeSet<_>>()
+    state
+        .topology
+        .get(&node.id)
+        .unwrap_or(&t)
+        .iter()
+        .map(|s| s.clone())
+        .collect()
+
+    // neighbors
 }
